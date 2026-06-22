@@ -103,9 +103,16 @@ class CodeInfoVisitor(ast.NodeVisitor):
     def visit_Call(self, node):
         func_name = self._get_func_name(node.func)
         if func_name:
+            # Find class context in scope stack
+            class_context = None
+            for scope in reversed(self.scope_stack):
+                if scope.startswith("class:"):
+                    class_context = scope.split(":", 1)[1]
+                    break
             self.calls.append({
                 'name': func_name,
-                'line': node.lineno
+                'line': node.lineno,
+                'class_context': class_context
             })
         self.generic_visit(node)
 
@@ -209,7 +216,7 @@ def build_index(target_dir):
     for file_path in all_files:
         rel_path = os.path.relpath(file_path, target_dir).replace(os.sep, '/')
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                 source = f.read()
             tree = ast.parse(source, filename=file_path)
             visitor = CodeInfoVisitor()
@@ -249,6 +256,7 @@ def build_index(target_dir):
         resolved_imports = []
         external_imports = set()
         local_imports_resolved = set()
+        star_imports = []
         
         # Build local name bindings
         local_bindings = {}
@@ -288,7 +296,7 @@ def build_index(target_dir):
                     for n in imp['names']:
                         bound_name = n['asname'] if n['asname'] else n['name']
                         if n['name'] == '*':
-                            local_bindings['*'] = ('star', resolved_rel, None)
+                            star_imports.append(resolved_rel)
                         else:
                             local_bindings[bound_name] = ('member', resolved_rel, n['name'])
             else:
@@ -300,33 +308,38 @@ def build_index(target_dir):
             call_name = call['name']
             resolved_target = None
             
-            # Simple name lookup
-            if '.' not in call_name:
+            # 1. Self call resolution inside class method
+            if call_name.startswith("self.") and call.get('class_context'):
+                class_name = call['class_context']
+                member_name = call_name.split(".", 1)[1]
+                resolved_target = {'type': 'local', 'file': rel_path, 'name': f"{class_name}.{member_name}"}
+            # 2. Simple name lookup
+            elif '.' not in call_name:
                 if call_name in local_bindings:
                     binding = local_bindings[call_name]
                     if binding[0] in ['local_func', 'local_class']:
                         resolved_target = {'type': 'local', 'file': binding[1], 'name': binding[2]}
                     elif binding[0] == 'member':
                         resolved_target = {'type': 'local', 'file': binding[1], 'name': binding[2]}
-                elif '*' in local_bindings:
-                    # Check if defined in star-imported module
-                    star_file = local_bindings['*'][1]
-                    if star_file in raw_data:
-                        star_visitor = raw_data[star_file]['visitor']
-                        # Check if function or class is defined there
-                        defined = False
-                        for f in star_visitor.functions:
-                            if f['name'] == call_name and not f['is_method'] and not f['is_nested']:
-                                defined = True
+                else:
+                    # Check all star-imported modules
+                    for star_file in star_imports:
+                        if star_file in raw_data:
+                            star_visitor = raw_data[star_file]['visitor']
+                            defined = False
+                            for f in star_visitor.functions:
+                                if f['name'] == call_name and not f['is_method'] and not f['is_nested']:
+                                    defined = True
+                                    break
+                            for c in star_visitor.classes:
+                                if c['name'] == call_name:
+                                    defined = True
+                                    break
+                            if defined:
+                                resolved_target = {'type': 'local', 'file': star_file, 'name': call_name}
                                 break
-                        for c in star_visitor.classes:
-                            if c['name'] == call_name:
-                                defined = True
-                                break
-                        if defined:
-                            resolved_target = {'type': 'local', 'file': star_file, 'name': call_name}
+            # 3. Dotted name lookup
             else:
-                # Dotted name lookup
                 parts = call_name.split('.')
                 prefix = parts[0]
                 if prefix in local_bindings:
@@ -335,6 +348,27 @@ def build_index(target_dir):
                         target_file = binding[1]
                         member_name = '.'.join(parts[1:])
                         resolved_target = {'type': 'local', 'file': target_file, 'name': member_name}
+                    elif binding[0] in ['local_class', 'member']:
+                        target_file = binding[1]
+                        class_name = binding[2]
+                        member_name = '.'.join(parts[1:])
+                        resolved_target = {'type': 'local', 'file': target_file, 'name': f"{class_name}.{member_name}"}
+                else:
+                    # Check if prefix (class name) is defined in star-imported modules
+                    for star_file in star_imports:
+                        if star_file in raw_data:
+                            star_visitor = raw_data[star_file]['visitor']
+                            is_class = False
+                            for c in star_visitor.classes:
+                                if c['name'] == prefix:
+                                    is_class = True
+                                    break
+                            if is_class:
+                                target_file = star_file
+                                class_name = prefix
+                                member_name = '.'.join(parts[1:])
+                                resolved_target = {'type': 'local', 'file': target_file, 'name': f"{class_name}.{member_name}"}
+                                break
             
             resolved_calls.append({
                 'name': call_name,
@@ -370,7 +404,7 @@ def build_index(target_dir):
 def find_cycles(index_data):
     graph = {f: data['local_imports_resolved'] for f, data in index_data['files'].items()}
     visited = {} # None: unvisited, 0: visiting, 1: visited
-    cycles = []
+    raw_cycles = []
     
     def dfs(node, path):
         visited[node] = 0
@@ -380,7 +414,7 @@ def find_cycles(index_data):
                 continue
             if visited.get(neighbor) == 0:
                 cycle_start_idx = path.index(neighbor)
-                cycles.append(path[cycle_start_idx:] + [neighbor])
+                raw_cycles.append(path[cycle_start_idx:] + [neighbor])
             elif neighbor not in visited:
                 dfs(neighbor, path)
         path.pop()
@@ -389,6 +423,21 @@ def find_cycles(index_data):
     for node in graph:
         if node not in visited:
             dfs(node, [])
+            
+    # Normalize and de-duplicate cycles
+    unique_cycles = set()
+    cycles = []
+    for c in raw_cycles:
+        if len(c) < 2:
+            continue
+        # Normalize: rotate so lexicographically smallest node is first
+        nodes = c[:-1]
+        min_idx = nodes.index(min(nodes))
+        rotated = nodes[min_idx:] + nodes[:min_idx]
+        cycle_tuple = tuple(rotated)
+        if cycle_tuple not in unique_cycles:
+            unique_cycles.add(cycle_tuple)
+            cycles.append(rotated + [rotated[0]])
             
     return cycles
 
@@ -427,27 +476,42 @@ def find_dead_code(index_data):
                 
     unused_definitions = []
     for file, data in index_data['files'].items():
-        # Top level functions
+        # Top level functions and methods
         for func in data['functions']:
-            if func['is_method']:
-                continue
             name = func['name']
             if name.startswith('__') or name == 'main':
                 continue
-            # Check if called anywhere (locally or externally)
-            called_internally = False
-            for call in data['calls']:
-                if call['resolved_to'] and call['resolved_to']['file'] == file and call['resolved_to']['name'] == name:
-                    called_internally = True
-                    break
-            called_externally = (file, name) in incoming_callers
-            if not called_internally and not called_externally:
-                unused_definitions.append({
-                    'type': 'function',
-                    'file': file,
-                    'name': name,
-                    'line': func['line']
-                })
+            
+            if func['is_method']:
+                class_name = func['class_name']
+                fullname = f"{class_name}.{name}"
+                called_internally = False
+                for call in data['calls']:
+                    if call['resolved_to'] and call['resolved_to']['file'] == file and call['resolved_to']['name'] == fullname:
+                        called_internally = True
+                        break
+                called_externally = (file, fullname) in incoming_callers
+                if not called_internally and not called_externally:
+                    unused_definitions.append({
+                        'type': 'method',
+                        'file': file,
+                        'name': fullname,
+                        'line': func['line']
+                    })
+            else:
+                called_internally = False
+                for call in data['calls']:
+                    if call['resolved_to'] and call['resolved_to']['file'] == file and call['resolved_to']['name'] == name:
+                        called_internally = True
+                        break
+                called_externally = (file, name) in incoming_callers
+                if not called_internally and not called_externally:
+                    unused_definitions.append({
+                        'type': 'function',
+                        'file': file,
+                        'name': name,
+                        'line': func['line']
+                    })
                 
         # Classes
         for cls in data['classes']:
@@ -524,10 +588,15 @@ def print_mermaid(index_data, root_file=None):
     else:
         files_to_print = set(index_data['files'].keys())
 
+    unused_files, _ = find_dead_code(index_data)
+    unused_files_set = set(unused_files)
+
     for f in files_to_print:
         # Print nodes with safe IDs
         safe_id = f.replace('.', '_').replace('/', '_').replace('-', '_')
         print(f"    {safe_id}[\"{f}\"]")
+        if f in unused_files_set:
+            print(f"    style {safe_id} fill:#ffcccc,stroke:#ff3333,stroke-width:2px")
 
     for file in files_to_print:
         if file not in index_data['files']:

@@ -178,5 +178,76 @@ if __name__ == '__main__':
         self.assertIn('func_c', unused_names)
         self.assertNotIn('func_a', unused_names)
 
+    def test_advanced_resolutions_and_de_duplication(self):
+        # 1. Circular import loop: a -> b -> a
+        # Also c -> a (not part of cycle, but imports a)
+        # 2. Multiple star imports in main.py: from lib1 import * and from lib2 import *
+        # 3. Class method call and self method call in lib1.py
+        # 4. CP1252 non-UTF8 file read to check robustness
+        
+        a_path = os.path.join(self.test_dir, "a.py")
+        b_path = os.path.join(self.test_dir, "b.py")
+        lib1_path = os.path.join(self.test_dir, "lib1.py")
+        lib2_path = os.path.join(self.test_dir, "lib2.py")
+        main_path = os.path.join(self.test_dir, "main.py")
+        cp1252_path = os.path.join(self.test_dir, "cp1252.py")
+        
+        with open(a_path, 'w', encoding='utf-8') as f:
+            f.write("import b\n")
+        with open(b_path, 'w', encoding='utf-8') as f:
+            f.write("import a\n")
+            
+        with open(lib1_path, 'w', encoding='utf-8') as f:
+            f.write("\nclass Helper:\n    def __init__(self):\n        self.init_helper()\n    def init_helper(self):\n        pass\n    def unused_method(self):\n        pass\n")
+        with open(lib2_path, 'w', encoding='utf-8') as f:
+            f.write("def lib2_func():\n    pass\n")
+            
+        with open(main_path, 'w', encoding='utf-8') as f:
+            f.write("\nfrom lib1 import *\nfrom lib2 import *\n\nh = Helper()\nHelper.init_helper(h)\nlib2_func()\n")
+        # Write non-UTF-8 CP1252 file with accent characters
+        with open(cp1252_path, 'wb') as f:
+            f.write(b"# \xe9\xe8\xe0 cp1252 accent\ndef cp1252_func():\n    pass\n")
+            
+        # Build index
+        index_data = trishula_mapper.build_index(self.test_dir)
+        
+        # Check that cp1252.py was successfully parsed instead of skipped
+        self.assertIn('cp1252.py', index_data['files'])
+        
+        # Check cycles (a.py <-> b.py should only return exactly 1 cycle loop)
+        cycles = trishula_mapper.find_cycles(index_data)
+        self.assertEqual(len(cycles), 1)
+        
+        # Check star imports call resolutions
+        calls_main = index_data['files']['main.py']['calls']
+        resolved_names = {c['name']: c['resolved_to'] for c in calls_main}
+        
+        # h = Helper() call should resolve to lib1.py Helper
+        self.assertIsNotNone(resolved_names.get('Helper'))
+        self.assertEqual(resolved_names['Helper']['file'], 'lib1.py')
+        self.assertEqual(resolved_names['Helper']['name'], 'Helper')
+        
+        # lib2_func() call should resolve to lib2.py lib2_func
+        self.assertIsNotNone(resolved_names.get('lib2_func'))
+        self.assertEqual(resolved_names['lib2_func']['file'], 'lib2.py')
+        
+        # Helper.init_helper(h) dotted class call should resolve to Helper.init_helper
+        self.assertIsNotNone(resolved_names.get('Helper.init_helper'))
+        self.assertEqual(resolved_names['Helper.init_helper']['file'], 'lib1.py')
+        self.assertEqual(resolved_names['Helper.init_helper']['name'], 'Helper.init_helper')
+        
+        # Self call `self.init_helper()` in lib1.py should resolve to Helper.init_helper
+        calls_lib1 = index_data['files']['lib1.py']['calls']
+        resolved_lib1 = {c['name']: c['resolved_to'] for c in calls_lib1}
+        self.assertIsNotNone(resolved_lib1.get('self.init_helper'))
+        self.assertEqual(resolved_lib1['self.init_helper']['file'], 'lib1.py')
+        self.assertEqual(resolved_lib1['self.init_helper']['name'], 'Helper.init_helper')
+        
+        # Unused definitions should detect Helper.unused_method
+        unused_files, unused_defs = trishula_mapper.find_dead_code(index_data)
+        unused_methods = [d['name'] for d in unused_defs if d['type'] == 'method']
+        self.assertIn('Helper.unused_method', unused_methods)
+        self.assertNotIn('Helper.init_helper', unused_methods)
+
 if __name__ == '__main__':
     unittest.main()
